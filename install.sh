@@ -26,8 +26,11 @@ say "Updating coding-agent-ai in ~/.flossware/ai"
 if command -v crush >/dev/null 2>&1; then CRUSH_BIN="$(command -v crush)"; elif [[ -x "$HOME/go/bin/crush" ]]; then CRUSH_BIN="$HOME/go/bin/crush"; elif command -v go >/dev/null 2>&1; then say "Installing Crush"; GOBIN="$HOME/.local/bin" go install github.com/charmbracelet/crush@latest; CRUSH_BIN="$HOME/.local/bin/crush"; else die "Crush is not installed and Go is unavailable"; fi
 [[ -x "$CRUSH_BIN" ]] || die "Crush installation failed"
 say "Installing FlossWare gateway"
-curl -fsSL "$RAW_BASE/gateway.py" -o "$GATEWAY"
+curl -fsSL --retry 3 "$RAW_BASE/gateway.py?cachebust=$(date +%s%N)" -o "$GATEWAY"
 chmod 0755 "$GATEWAY"
+"$PY" -m py_compile "$GATEWAY" || die "Downloaded FlossWare gateway is not valid Python"
+grep -q 'if path == "/health":' "$GATEWAY" || die "Downloaded gateway lacks /health endpoint"
+grep -q 'model must be flossware and messages must be non-empty' "$GATEWAY" || die "Downloaded gateway lacks chat validation"
 : > "$ENVFILE"
 if [[ -f "$HOME/.bashrc" ]]; then
   grep -E '^[[:space:]]*(export[[:space:]]+)?[A-Z0-9]+_API_KEY(_[A-Z0-9_]+)?[[:space:]]*=' "$HOME/.bashrc" |
@@ -62,21 +65,21 @@ RestartSec=2
 [Install]
 WantedBy=default.target
 EOF
-
-# A previous installer attempt can leave a gateway on port 8765. Stop only the
-# process recorded by our own pidfile before starting a fresh instance.
-stop_stale_gateway() {
+stop_stale_gateway(){
   if [[ -s "$PIDFILE" ]]; then
     local oldpid
     oldpid="$(cat "$PIDFILE" 2>/dev/null || true)"
     if [[ "$oldpid" =~ ^[0-9]+$ ]] && kill -0 "$oldpid" 2>/dev/null; then
       kill "$oldpid" 2>/dev/null || true
-      for _ in {1..20}; do kill -0 "$oldpid" 2>/dev/null || break; sleep .1; done
+      for _ in {1..30}; do kill -0 "$oldpid" 2>/dev/null || break; sleep .1; done
     fi
   fi
+  # The installer historically reused a healthy gateway even after replacing
+  # its source. Kill only processes running our exact gateway path so a stale
+  # instance cannot survive an upgrade with old Python code in memory.
+  pkill -f "[p]ython.*$GATEWAY" 2>/dev/null || true
   rm -f "$PIDFILE"
 }
-
 wait_for_gateway(){
   local i code
   for i in {1..40}; do
@@ -87,13 +90,12 @@ wait_for_gateway(){
   return 1
 }
 start_gateway(){
-  # Reuse a genuinely healthy existing gateway, otherwise clear our stale
-  # instance and start a fresh one.
-  if wait_for_gateway; then return 0; fi
+  # Always restart our gateway after replacing gateway.py. Reusing a healthy
+  # process here would keep the previous Python source resident in memory.
   stop_stale_gateway
   : > "$LOGFILE"
   if [[ -n "${XDG_RUNTIME_DIR:-}" && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && systemctl --user daemon-reload 2>/dev/null; then
-    if systemctl --user enable --now flossware-crush-gateway.service 2>/dev/null && wait_for_gateway; then return 0; fi
+    if systemctl --user restart flossware-crush-gateway.service 2>/dev/null && wait_for_gateway; then return 0; fi
   fi
   nohup "$RUN_GATEWAY" >>"$LOGFILE" 2>&1 </dev/null &
   echo $! >"$PIDFILE"
