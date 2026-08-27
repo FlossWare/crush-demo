@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Local OpenAI-compatible FlossWare gateway for Crush.
-
-Crush sees one model, ``flossware``. Credentials use the convention
-PROVIDER_API_KEY or PROVIDER_API_KEY_ACCOUNT. Account suffixes are optional.
-Only providers in the allow-list below are considered; RH/Anthropic/OpenAI
-credentials are never consumed.
-"""
+"""Local OpenAI-compatible FlossWare gateway for Crush."""
 from __future__ import annotations
 
 import json
@@ -21,9 +15,6 @@ PORT = int(os.getenv("FLOSSWARE_GATEWAY_PORT", "8765"))
 MODEL = "flossware"
 TIMEOUT = 180
 KEY_RE = re.compile(r"^(?P<provider>[A-Z0-9]+)_API_KEY(?:_(?P<account>[A-Z0-9][A-Z0-9_]*))?$")
-
-# Only providers with known OpenAI-compatible endpoints are eligible here.
-# This is deliberately an allow-list, not "use every secret in the environment".
 PROVIDERS = {
     "deepinfra": "https://api.deepinfra.com/v1/openai",
     "openrouter": "https://openrouter.ai/api/v1",
@@ -54,7 +45,6 @@ def _ollama_models() -> list[str]:
 
 
 def _credentials() -> list[tuple[str, str, str, str]]:
-    """Return provider, account, env-var, secret for known API-key variables."""
     found = []
     for env_name, secret in os.environ.items():
         if not secret:
@@ -71,15 +61,13 @@ def _credentials() -> list[tuple[str, str, str, str]]:
 
 
 def _model_hints(provider: str, account: str) -> list[str]:
-    """Read optional model hints using the same optional-account convention."""
     suffix = "" if account == "default" else "_" + account.upper()
-    names = [
+    for name in (
         f"FLOSSWARE_{provider.upper()}_MODELS{suffix}",
         f"FLOSSWARE_{provider.upper()}_MODEL{suffix}",
         f"{provider.upper()}_MODELS{suffix}",
         f"{provider.upper()}_MODEL{suffix}",
-    ]
-    for name in names:
+    ):
         value = os.getenv(name, "")
         if value:
             return [x.strip() for x in value.split(",") if x.strip()]
@@ -93,8 +81,7 @@ def _openrouter_free_models(key: str) -> list[str]:
     try:
         catalog = _request("GET", "https://openrouter.ai/api/v1/models", api_key=key)
         return [
-            item.get("id", "")
-            for item in catalog.get("data", [])
+            item.get("id", "") for item in catalog.get("data", [])
             if str(item.get("pricing", {}).get("prompt", "")) == "0"
             and str(item.get("pricing", {}).get("completion", "")) == "0"
             and item.get("id")
@@ -104,18 +91,12 @@ def _openrouter_free_models(key: str) -> list[str]:
 
 
 def _backends() -> list[tuple[str, str, str, str, str]]:
-    """Return (provider, account, base_url, model, key), free/local only."""
     result = []
     local = _ollama_models()
     if local:
         result.append(("ollama", "local", "http://127.0.0.1:11434/v1", local[0], ""))
-
     for provider, account, _env, key in _credentials():
-        if provider == "openrouter":
-            models = _openrouter_free_models(key)
-        else:
-            models = _model_hints(provider, account)
-        # Unknown cloud pricing is never assumed to be free.
+        models = _openrouter_free_models(key) if provider == "openrouter" else _model_hints(provider, account)
         if models:
             result.append((provider, account, PROVIDERS[provider], models[0], key))
     return result
@@ -136,8 +117,7 @@ def _chat(messages: list[dict], temperature: float, max_tokens: int | None) -> t
             errors.append(f"{provider}/{account}: empty response")
         except Exception as exc:
             errors.append(f"{provider}/{account}: {exc}")
-    detail = "; ".join(errors)
-    raise RuntimeError("No free/local backend succeeded." + (" " + detail if detail else " No backend configured."))
+    raise RuntimeError("No free/local backend succeeded." + (" " + "; ".join(errors) if errors else " No backend configured."))
 
 
 def _models() -> list[dict]:
@@ -145,26 +125,25 @@ def _models() -> list[dict]:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "FlossWareGateway/0.3"
+    server_version = "FlossWareGateway/0.4"
 
     def _json(self, status: int, payload: dict) -> None:
         data = json.dumps(payload).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            # Health/readiness probes can disconnect immediately after headers.
+            pass
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         if path == "/health":
-            self._json(200, {
-                "status": "ok",
-                "model": MODEL,
-                "policy": "free-only",
-                "backends": [f"{p}/{a}" for p, a, *_ in _backends()],
-                "accounts": [f"{p}/{a}" for p, a, *_ in _credentials()],
-            })
+            # Health is deliberately cheap and must never probe remote providers.
+            self._json(200, {"status": "ok", "model": MODEL, "policy": "free-only"})
         elif path == "/v1/models":
             self._json(200, {"object": "list", "data": _models()})
         else:
