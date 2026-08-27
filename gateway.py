@@ -28,7 +28,7 @@ BLOCKED = {"anthropic", "openai", "redhat", "rh"}
 
 def _request(method: str, url: str, body: dict | None = None, api_key: str = "") -> dict:
     data = json.dumps(body).encode() if body is not None else None
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -102,18 +102,22 @@ def _backends() -> list[tuple[str, str, str, str, str]]:
     return result
 
 
-def _chat(messages: list[dict], temperature: float, max_tokens: int | None) -> tuple[str, dict, str]:
+def _chat(messages: list[dict], temperature: float, max_tokens: int | None, extra: dict | None = None) -> tuple[dict, str]:
     errors = []
+    extra = extra or {}
     for provider, account, base, model, key in _backends():
         body = {"model": model, "messages": messages, "temperature": temperature}
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
+        # Preserve OpenAI-compatible agent fields such as tools/tool_choice.
+        for field in ("tools", "tool_choice", "response_format", "top_p", "stop", "seed"):
+            if field in extra:
+                body[field] = extra[field]
         try:
             raw = _request("POST", f"{base}/chat/completions", body, key)
             choice = raw.get("choices", [{}])[0]
-            content = choice.get("message", {}).get("content", "")
-            if content:
-                return content, raw.get("usage", {}), f"{provider}/{account}/{model}"
+            if choice.get("message", {}).get("content") or choice.get("message", {}).get("tool_calls"):
+                return raw, f"{provider}/{account}/{model}"
             errors.append(f"{provider}/{account}: empty response")
         except Exception as exc:
             errors.append(f"{provider}/{account}: {exc}")
@@ -125,7 +129,7 @@ def _models() -> list[dict]:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "FlossWareGateway/0.4"
+    server_version = "FlossWareGateway/0.5"
 
     def _json(self, status: int, payload: dict) -> None:
         data = json.dumps(payload).encode()
@@ -136,13 +140,53 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
-            # Health/readiness probes can disconnect immediately after headers.
+            pass
+
+    def _sse(self, raw: dict, backend: str) -> None:
+        """Turn a completed OpenAI response into valid SSE for Crush.
+
+        The upstream request is non-streaming for maximum provider compatibility,
+        then the completed message is emitted as OpenAI-compatible SSE chunks.
+        Crush primarily needs the streaming protocol, not upstream token streaming.
+        """
+        choice = raw.get("choices", [{}])[0]
+        message = choice.get("message", {})
+        content = message.get("content") or ""
+        tool_calls = message.get("tool_calls")
+        response_id = raw.get("id", "flossware-" + str(int(time.time() * 1000)))
+        created = raw.get("created", int(time.time()))
+
+        chunks = []
+        if tool_calls:
+            chunks.append({"index": 0, "delta": {"role": "assistant", "tool_calls": tool_calls}, "finish_reason": None})
+        elif content:
+            chunks.append({"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": None})
+        chunks.append({"index": 0, "delta": {}, "finish_reason": choice.get("finish_reason", "stop")})
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            for chunk in chunks:
+                payload = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": MODEL,
+                    "choices": [chunk],
+                }
+                self.wfile.write(("data: " + json.dumps(payload) + "\n\n").encode())
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
             pass
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         if path == "/health":
-            # Health is deliberately cheap and must never probe remote providers.
             self._json(200, {"status": "ok", "model": MODEL, "policy": "free-only"})
         elif path == "/v1/models":
             self._json(200, {"object": "list", "data": _models()})
@@ -159,16 +203,18 @@ class Handler(BaseHTTPRequestHandler):
             messages = body.get("messages", [])
             if not messages or body.get("model", MODEL) != MODEL:
                 raise ValueError("model must be flossware and messages must be non-empty")
-            content, usage, backend = _chat(messages, float(body.get("temperature", 0.2)), body.get("max_tokens"))
-            self._json(200, {
-                "id": "flossware-" + str(int(time.time() * 1000)),
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": MODEL,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
-                "usage": usage,
-                "flossware_backend": backend,
-            })
+            raw, backend = _chat(
+                messages,
+                float(body.get("temperature", 0.2)),
+                body.get("max_tokens"),
+                body,
+            )
+            if body.get("stream"):
+                self._sse(raw, backend)
+                return
+            raw["model"] = MODEL
+            raw["flossware_backend"] = backend
+            self._json(200, raw)
         except Exception as exc:
             self._json(503, {"error": {"message": str(exc), "type": "flossware_unavailable"}})
 
