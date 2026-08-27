@@ -5,6 +5,7 @@ ROOT="${FLOSSWARE_AI_HOME:-$HOME/.flossware/ai}"
 VENV="$ROOT/venv"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/crush"
 REPO="https://github.com/FlossWare/coding-agent-ai.git"
+RAW_BASE="https://raw.githubusercontent.com/FlossWare/crush-demo/main"
 
 say() { printf '\n==> %s\n' "$*"; }
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
@@ -37,8 +38,6 @@ say "Installing/updating coding-agent-ai in the existing FlossWare environment"
 "$PY" -m pip install --quiet --upgrade pip
 "$PY" -m pip install --quiet "git+$REPO"
 
-# Expose the existing personal-agent CLI without requiring the venv to be
-# activated. A wrapper is safer than changing the user's shell globally.
 cat > "$HOME/.local/bin/pa" <<EOF
 #!/usr/bin/env bash
 exec "$VENV/bin/pa" "\$@"
@@ -60,11 +59,12 @@ fi
 
 [[ -x "$CRUSH_BIN" ]] || die "Crush installation failed"
 
-# Install our project-local Crush config globally. It is intentionally a
-# standalone file, not a copy of any existing employer/personal config.
-install -m 0644 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/crushrc" "$CONFIG_DIR/crushrc"
+# curl|bash has no repository working tree, so fetch the config explicitly.
+TMP_CONFIG="$(mktemp)"
+trap 'rm -f "$TMP_CONFIG"' EXIT
+curl -fsSL "$RAW_BASE/crushrc" -o "$TMP_CONFIG"
+install -m 0644 "$TMP_CONFIG" "$CONFIG_DIR/crushrc"
 
-# Helper commands.
 cat > "$HOME/.local/bin/flossware-crush" <<'EOF'
 #!/usr/bin/env bash
 exec crush "$@"
