@@ -62,21 +62,50 @@ RestartSec=2
 [Install]
 WantedBy=default.target
 EOF
-wait_for_gateway(){ local i; for i in {1..30}; do curl -fsS --max-time 1 http://127.0.0.1:8765/health >/dev/null 2>&1 && return 0; sleep .25; done; return 1; }
+
+# A previous installer attempt can leave a gateway on port 8765. Stop only the
+# process recorded by our own pidfile before starting a fresh instance.
+stop_stale_gateway() {
+  if [[ -s "$PIDFILE" ]]; then
+    local oldpid
+    oldpid="$(cat "$PIDFILE" 2>/dev/null || true)"
+    if [[ "$oldpid" =~ ^[0-9]+$ ]] && kill -0 "$oldpid" 2>/dev/null; then
+      kill "$oldpid" 2>/dev/null || true
+      for _ in {1..20}; do kill -0 "$oldpid" 2>/dev/null || break; sleep .1; done
+    fi
+  fi
+  rm -f "$PIDFILE"
+}
+
+wait_for_gateway(){
+  local i code
+  for i in {1..40}; do
+    code="$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/health 2>/dev/null || true)"
+    [[ "$code" == "200" ]] && return 0
+    sleep .25
+  done
+  return 1
+}
 start_gateway(){
-  curl -fsS --max-time 1 http://127.0.0.1:8765/health >/dev/null 2>&1 && return 0 || true
-  if [[ -n "${XDG_RUNTIME_DIR:-}" && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && systemctl --user daemon-reload 2>/dev/null; then systemctl --user enable --now flossware-crush-gateway.service 2>/dev/null && wait_for_gateway && return 0 || true; fi
-  rm -f "$PIDFILE"; : > "$LOGFILE"; nohup "$RUN_GATEWAY" >>"$LOGFILE" 2>&1 </dev/null & echo $! >"$PIDFILE"
-  wait_for_gateway && return 0
-  printf '\nERROR: FlossWare gateway failed to become ready.\nLog: %s\n' "$LOGFILE" >&2; tail -n 40 "$LOGFILE" >&2 || true; return 1
+  # Reuse a genuinely healthy existing gateway, otherwise clear our stale
+  # instance and start a fresh one.
+  if wait_for_gateway; then return 0; fi
+  stop_stale_gateway
+  : > "$LOGFILE"
+  if [[ -n "${XDG_RUNTIME_DIR:-}" && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && systemctl --user daemon-reload 2>/dev/null; then
+    if systemctl --user enable --now flossware-crush-gateway.service 2>/dev/null && wait_for_gateway; then return 0; fi
+  fi
+  nohup "$RUN_GATEWAY" >>"$LOGFILE" 2>&1 </dev/null &
+  echo $! >"$PIDFILE"
+  if wait_for_gateway; then return 0; fi
+  printf '\nERROR: FlossWare gateway failed to become ready.\nLog: %s\n' "$LOGFILE" >&2
+  tail -n 40 "$LOGFILE" >&2 || true
+  return 1
 }
 start_gateway
 say "Configuring Crush"
 cat > "$CONFIG_DIR/crushrc" <<'EOF'
 #!/usr/bin/env bash
-# Personal FlossWare mode: do not allow Crush's built-in provider catalog to
-# reintroduce OpenAI/Anthropic/Hyper/etc. Only the local FlossWare gateway is
-# registered here.
 option metrics false
 option provider-auto-update false
 option default-providers false
