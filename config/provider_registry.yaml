@@ -1,0 +1,13 @@
+# Provider metadata. Credentials are discovered from the environment.
+# Default convention: PROVIDER_API_KEY or PROVIDER_API_KEY_ACCOUNT.
+providers:
+  deepinfra:
+    endpoint: https://api.deepinfra.com/v1/openai
+  openrouter:
+    endpoint: https://openrouter.ai/api/v1
+  groq:
+    endpoint: https://api.groq.com/openai/v1
+  cerebras:
+    endpoint: https://api.cerebras.ai/v1
+  gemini:
+    endpoint: https://generativelanguage.googleapis.com/v1beta/openai
