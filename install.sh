@@ -28,16 +28,12 @@ if command -v crush >/dev/null 2>&1; then CRUSH_BIN="$(command -v crush)"; elif 
 say "Installing FlossWare gateway"
 curl -fsSL "$RAW_BASE/gateway.py" -o "$GATEWAY"
 chmod 0755 "$GATEWAY"
-# Extract only the supported credential assignments. Never source ~/.bashrc:
-# Fedora/system rc files can contain arbitrary interactive shell code.
 : > "$ENVFILE"
 if [[ -f "$HOME/.bashrc" ]]; then
   grep -E '^[[:space:]]*(export[[:space:]]+)?[A-Z0-9]+_API_KEY(_[A-Z0-9_]+)?[[:space:]]*=' "$HOME/.bashrc" |
     sed -E 's/^[[:space:]]*export[[:space:]]+//' >> "$ENVFILE" || true
 fi
 chmod 0600 "$ENVFILE"
-# This launcher is itself a non-interactive Bash script, so /etc/bashrc and
-# ~/.bashrc are not loaded. It imports only our filtered credential file.
 cat > "$RUN_GATEWAY" <<EOF
 #!/usr/bin/env bash
 set -e
@@ -78,23 +74,32 @@ start_gateway
 say "Configuring Crush"
 cat > "$CONFIG_DIR/crushrc" <<'EOF'
 #!/usr/bin/env bash
+# Personal FlossWare mode: do not allow Crush's built-in provider catalog to
+# reintroduce OpenAI/Anthropic/Hyper/etc. Only the local FlossWare gateway is
+# registered here.
 option metrics false
 option provider-auto-update false
+option default-providers false
 provider remove anthropic 2>/dev/null || true
-provider remove redhat 2>/dev/null || true
 provider remove openai 2>/dev/null || true
+provider remove redhat 2>/dev/null || true
 provider remove ollama 2>/dev/null || true
-provider add flossware --name "FlossWare Personal" --type openai-compat --base-url "http://127.0.0.1:8765/v1" --api-key "local"
+provider remove hyper 2>/dev/null || true
+provider add flossware --name "FlossWare Personal" --type openai-compat --base-url "http://127.0.0.1:8765/v1" --api-key "local" --discover-models false
 model add flossware/flossware --name "FlossWare (free/local)" --context-window 128000 --default-max-tokens 16384
 model large flossware/flossware
 model small flossware/flossware
-if [[ -n "${GH_PAT:-}" ]]; then mcp add github --type http --url "https://api.githubcopilot.com/mcp/" --header Authorization "Bearer $GH_PAT"; elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then mcp add github --type http --url "https://api.githubcopilot.com/mcp/" --header Authorization "Bearer $(gh auth token)"; fi
+if [[ -n "${GH_PAT:-}" ]]; then
+  mcp add github --type http --url "https://api.githubcopilot.com/mcp/" --header Authorization "Bearer $GH_PAT"
+elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+  mcp add github --type http --url "https://api.githubcopilot.com/mcp/" --header Authorization "Bearer $(gh auth token)"
+fi
 permissions allow view ls grep edit bash
 EOF
 chmod 0644 "$CONFIG_DIR/crushrc"
 cat > "$HOME/.local/bin/flossware-crush" <<'EOF'
 #!/usr/bin/env bash
-exec crush "$@"
+exec env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u HYPER_API_KEY crush "$@"
 EOF
 chmod +x "$HOME/.local/bin/flossware-crush"
 cat > "$HOME/.local/bin/flossware-models" <<'EOF'
