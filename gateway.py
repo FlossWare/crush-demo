@@ -79,40 +79,43 @@ def _model_hints(provider: str, account: str) -> list[str]:
     return []
 
 
-def _openrouter_free_models(key: str) -> list[str]:
+def _openrouter_free_models(key: str, require_tools: bool = False) -> list[str]:
     explicit = [x.strip() for x in os.getenv("FLOSSWARE_OPENROUTER_FREE_MODELS", "").split(",") if x.strip()]
     if explicit:
         return explicit
     try:
         catalog = _request("GET", "https://openrouter.ai/api/v1/models", api_key=key)
-        return [
-            item.get("id", "") for item in catalog.get("data", [])
-            if str(item.get("pricing", {}).get("prompt", "")) == "0"
-            and str(item.get("pricing", {}).get("completion", "")) == "0"
-            and item.get("id")
-        ]
+        models = []
+        for item in catalog.get("data", []):
+            if str(item.get("pricing", {}).get("prompt", "")) != "0" or str(item.get("pricing", {}).get("completion", "")) != "0":
+                continue
+            if not item.get("id"):
+                continue
+            if require_tools:
+                supported = item.get("supported_parameters") or []
+                if "tools" not in supported and "tool_choice" not in supported:
+                    continue
+            models.append(item["id"])
+        return models
     except Exception:
         return []
 
 
-def _backends() -> list[tuple[str, str, str, str, str]]:
+def _backends(require_tools: bool = False) -> list[tuple[str, str, str, str, str]]:
     result = []
-    local = _ollama_models()
-    if local:
-        result.append(("ollama", "local", "http://127.0.0.1:11434/v1", local[0], ""))
+    if not require_tools:
+        local = _ollama_models()
+        if local:
+            result.append(("ollama", "local", "http://127.0.0.1:11434/v1", local[0], ""))
     for provider, account, _env, key in _credentials():
-        models = _openrouter_free_models(key) if provider == "openrouter" else _model_hints(provider, account)
+        models = _openrouter_free_models(key, require_tools) if provider == "openrouter" else _model_hints(provider, account)
         if models:
             result.append((provider, account, PROVIDERS[provider], models[0], key))
     return result
 
 
 def _normalize_tool_calls(tool_calls: object) -> list[dict]:
-    """Return OpenAI-compatible tool calls with JSON-string arguments.
-
-    Providers sometimes return arguments as a dict/object. Crush expects the
-    OpenAI wire format where function.arguments is a JSON-encoded string.
-    """
+    """Return OpenAI-compatible tool calls with JSON-string arguments."""
     if not isinstance(tool_calls, list):
         return []
     normalized: list[dict] = []
@@ -129,9 +132,8 @@ def _normalize_tool_calls(tool_calls: object) -> list[dict]:
         if isinstance(arguments, str):
             try:
                 parsed = json.loads(arguments)
-            except json.JSONDecodeError:
-                # Do not pass malformed arguments downstream to Crush.
-                raise ValueError(f"tool call {name!r} returned invalid JSON arguments")
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"tool call {name!r} returned invalid JSON arguments") from exc
             arguments = json.dumps(parsed, separators=(",", ":"))
         else:
             try:
@@ -147,7 +149,6 @@ def _normalize_tool_calls(tool_calls: object) -> list[dict]:
 
 
 def _normalize_response(raw: dict) -> dict:
-    """Normalize an upstream completion for Crush."""
     choices = raw.get("choices")
     if not isinstance(choices, list) or not choices:
         raise ValueError("upstream response has no choices")
@@ -167,7 +168,8 @@ def _normalize_response(raw: dict) -> dict:
 def _chat(messages: list[dict], temperature: float, max_tokens: int | None, extra: dict | None = None) -> tuple[dict, str]:
     errors = []
     extra = extra or {}
-    for provider, account, base, model, key in _backends():
+    require_tools = bool(extra.get("tools"))
+    for provider, account, base, model, key in _backends(require_tools):
         body = {"model": model, "messages": messages, "temperature": temperature}
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
@@ -191,7 +193,7 @@ def _models() -> list[dict]:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "FlossWareGateway/0.6"
+    server_version = "FlossWareGateway/0.7"
 
     def _json(self, status: int, payload: dict) -> None:
         data = json.dumps(payload).encode()
@@ -211,7 +213,6 @@ class Handler(BaseHTTPRequestHandler):
         tool_calls = _normalize_tool_calls(message.get("tool_calls")) if message.get("tool_calls") else []
         response_id = raw.get("id", "flossware-" + str(int(time.time() * 1000)))
         created = raw.get("created", int(time.time()))
-
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -219,22 +220,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             if tool_calls:
-                # Emit one complete, valid tool call. Crush can consume a complete
-                # tool call even though the upstream provider was non-streaming.
                 for index, call in enumerate(tool_calls):
-                    delta = {
-                        "role": "assistant" if index == 0 else None,
-                        "tool_calls": [{
-                            "index": index,
-                            "id": call["id"],
-                            "type": "function",
-                            "function": {
-                                "name": call["function"]["name"],
-                                "arguments": call["function"]["arguments"],
-                            },
-                        }],
-                    }
-                    delta = {k: v for k, v in delta.items() if v is not None}
+                    delta = {"tool_calls": [{"index": index, "id": call["id"], "type": "function", "function": {"name": call["function"]["name"], "arguments": call["function"]["arguments"]}}]}
+                    if index == 0:
+                        delta["role"] = "assistant"
                     chunk = {"index": 0, "delta": delta, "finish_reason": None}
                     payload = {"id": response_id, "object": "chat.completion.chunk", "created": created, "model": MODEL, "choices": [chunk]}
                     self.wfile.write(("data: " + json.dumps(payload) + "\n\n").encode())
