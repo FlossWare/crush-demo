@@ -56,20 +56,15 @@ say "Installing FlossWare gateway"
 curl -fsSL "$RAW_BASE/gateway.py" -o "$GATEWAY"
 chmod 0755 "$GATEWAY"
 
-# ~/.bashrc is the credential source of truth. It may use nounset-sensitive
-# variables, so disable nounset only while sourcing it. Secret values are
-# never copied to disk.
+# ~/.bashrc is the credential source of truth. Source it in a clean child
+# shell with nounset disabled, then exec Python so all exported variables are
+# preserved without allowing interactive shell setup to kill the gateway.
 cat > "$RUN_GATEWAY" <<EOF
 #!/usr/bin/env bash
-set -eo pipefail
-if [[ -f "\$HOME/.bashrc" ]]; then
-  set +u
-  source "\$HOME/.bashrc" || true
-  set -u
-fi
+set -e
 export FLOSSWARE_GATEWAY_HOST=127.0.0.1
 export FLOSSWARE_GATEWAY_PORT=8765
-exec "$PY" "$GATEWAY"
+exec bash -c 'set +u; if [[ -f "\$HOME/.bashrc" ]]; then source "\$HOME/.bashrc" || true; fi; exec "\$1" "\$2"' -- "$PY" "$GATEWAY"
 EOF
 chmod 0700 "$RUN_GATEWAY"
 
