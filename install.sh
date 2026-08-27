@@ -7,6 +7,8 @@ VENV="$ROOT/venv"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/crush"
 SERVICE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 SERVICE="$SERVICE_DIR/flossware-crush-gateway.service"
+PIDFILE="$ROOT/crush-gateway.pid"
+LOGFILE="$ROOT/crush-gateway.log"
 REPO="https://github.com/FlossWare/coding-agent-ai.git"
 RAW_BASE="https://raw.githubusercontent.com/FlossWare/crush-demo/main"
 GATEWAY="$ROOT/crush-gateway.py"
@@ -54,10 +56,9 @@ say "Installing FlossWare gateway"
 curl -fsSL "$RAW_BASE/gateway.py" -o "$GATEWAY"
 chmod 0755 "$GATEWAY"
 
-# The user's .bashrc remains the credential source of truth. The service
-# sources it at startup, so newly-added PROVIDER_API_KEY[_ACCOUNT] variables
-# become available after restarting the user service. The gateway itself has
-# a strict provider allow-list and never consumes RH/Anthropic/OpenAI keys.
+# ~/.bashrc is the credential source of truth. The launcher sources it at
+# startup, so PROVIDER_API_KEY[_ACCOUNT] variables are discovered without
+# copying their secret values into another credentials file.
 cat > "$RUN_GATEWAY" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -84,8 +85,26 @@ RestartSec=2
 WantedBy=default.target
 EOF
 
-systemctl --user daemon-reload || true
-systemctl --user enable --now flossware-crush-gateway.service || true
+# systemd --user requires a live user D-Bus session. This may be absent when
+# invoked over SSH, from a bare TTY, or through curl|bash. Do not emit a
+# confusing bus error: fall back to a user-owned background process now.
+start_gateway() {
+  if [[ -n "${XDG_RUNTIME_DIR:-}" && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && systemctl --user daemon-reload 2>/dev/null; then
+    systemctl --user enable --now flossware-crush-gateway.service
+    return
+  fi
+
+  if [[ -s "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    return
+  fi
+  rm -f "$PIDFILE"
+  nohup "$RUN_GATEWAY" >>"$LOGFILE" 2>&1 &
+  echo $! >"$PIDFILE"
+  sleep 1
+  kill -0 "$(cat "$PIDFILE")" 2>/dev/null || die "FlossWare gateway failed to start; see $LOGFILE"
+}
+
+start_gateway
 
 say "Configuring Crush"
 cat > "$CONFIG_DIR/crushrc" <<'EOF'
@@ -128,6 +147,8 @@ curl -fsS --max-time 5 http://127.0.0.1:8765/health || {
   echo 'FlossWare gateway is not running' >&2
   exit 1
 }
+printf '\nModels:\n'
+curl -fsS --max-time 5 http://127.0.0.1:8765/v1/models
 EOF
 chmod +x "$HOME/.local/bin/flossware-models"
 
