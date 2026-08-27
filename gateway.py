@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Tiny OpenAI-compatible FlossWare gateway.
+"""Local OpenAI-compatible FlossWare gateway for Crush.
 
-Crush sees one model: ``flossware``. This process chooses only an explicitly
-allowed local/free backend. It deliberately does not read Anthropic, OpenAI,
-Red Hat, or arbitrary provider credentials.
+Crush sees one model, ``flossware``. Credentials use the convention
+PROVIDER_API_KEY or PROVIDER_API_KEY_ACCOUNT. Account suffixes are optional.
+Only providers in the allow-list below are considered; RH/Anthropic/OpenAI
+credentials are never consumed.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import time
-import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -19,6 +20,19 @@ HOST = os.getenv("FLOSSWARE_GATEWAY_HOST", "127.0.0.1")
 PORT = int(os.getenv("FLOSSWARE_GATEWAY_PORT", "8765"))
 MODEL = "flossware"
 TIMEOUT = 180
+KEY_RE = re.compile(r"^(?P<provider>[A-Z0-9]+)_API_KEY(?:_(?P<account>[A-Z0-9][A-Z0-9_]*))?$")
+
+# Only providers with known OpenAI-compatible endpoints are eligible here.
+# This is deliberately an allow-list, not "use every secret in the environment".
+PROVIDERS = {
+    "deepinfra": "https://api.deepinfra.com/v1/openai",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "groq": "https://api.groq.com/openai/v1",
+    "cerebras": "https://api.cerebras.ai/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "huggingface": "https://router.huggingface.co/v1",
+}
+BLOCKED = {"anthropic", "openai", "redhat", "rh"}
 
 
 def _request(method: str, url: str, body: dict | None = None, api_key: str = "") -> dict:
@@ -39,48 +53,77 @@ def _ollama_models() -> list[str]:
         return []
 
 
-def _backends() -> list[tuple[str, str, str, str]]:
-    """Return (name, base_url, model, key) in safe preference order."""
-    result: list[tuple[str, str, str, str]] = []
+def _credentials() -> list[tuple[str, str, str, str]]:
+    """Return provider, account, env-var, secret for known API-key variables."""
+    found = []
+    for env_name, secret in os.environ.items():
+        if not secret:
+            continue
+        match = KEY_RE.match(env_name)
+        if not match:
+            continue
+        provider = match.group("provider").lower()
+        if provider in BLOCKED or provider not in PROVIDERS:
+            continue
+        account = (match.group("account") or "default").lower()
+        found.append((provider, account, env_name, secret))
+    return sorted(found, key=lambda x: (x[0], x[1], x[2]))
+
+
+def _model_hints(provider: str, account: str) -> list[str]:
+    """Read optional model hints using the same optional-account convention."""
+    suffix = "" if account == "default" else "_" + account.upper()
+    names = [
+        f"FLOSSWARE_{provider.upper()}_MODELS{suffix}",
+        f"FLOSSWARE_{provider.upper()}_MODEL{suffix}",
+        f"{provider.upper()}_MODELS{suffix}",
+        f"{provider.upper()}_MODEL{suffix}",
+    ]
+    for name in names:
+        value = os.getenv(name, "")
+        if value:
+            return [x.strip() for x in value.split(",") if x.strip()]
+    return []
+
+
+def _openrouter_free_models(key: str) -> list[str]:
+    explicit = [x.strip() for x in os.getenv("FLOSSWARE_OPENROUTER_FREE_MODELS", "").split(",") if x.strip()]
+    if explicit:
+        return explicit
+    try:
+        catalog = _request("GET", "https://openrouter.ai/api/v1/models", api_key=key)
+        return [
+            item.get("id", "")
+            for item in catalog.get("data", [])
+            if str(item.get("pricing", {}).get("prompt", "")) == "0"
+            and str(item.get("pricing", {}).get("completion", "")) == "0"
+            and item.get("id")
+        ]
+    except Exception:
+        return []
+
+
+def _backends() -> list[tuple[str, str, str, str, str]]:
+    """Return (provider, account, base_url, model, key), free/local only."""
+    result = []
     local = _ollama_models()
     if local:
-        result.append(("ollama", "http://127.0.0.1:11434/v1", local[0], ""))
+        result.append(("ollama", "local", "http://127.0.0.1:11434/v1", local[0], ""))
 
-    explicit = (
-        ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY", "FLOSSWARE_GEMINI_MODEL"),
-        ("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY", "FLOSSWARE_GROQ_MODEL"),
-        ("cerebras", "https://api.cerebras.ai/v1", "CEREBRAS_API_KEY", "FLOSSWARE_CEREBRAS_MODEL"),
-        ("huggingface", "https://router.huggingface.co/v1", "HUGGINGFACE_API_KEY", "FLOSSWARE_HUGGINGFACE_MODELS"),
-    )
-    for name, base, keyvar, modelvar in explicit:
-        key = os.getenv(keyvar, "")
-        models = [x.strip() for x in os.getenv(modelvar, "").split(",") if x.strip()]
-        if key and models:
-            result.append((name, base, models[0], key))
-
-    # OpenRouter is special: when no explicit free model is supplied, query
-    # its catalog and admit only models whose prompt and completion pricing are
-    # exactly zero.
-    key = os.getenv("OPENROUTER_API_KEY", "")
-    if key:
-        models = [x.strip() for x in os.getenv("FLOSSWARE_OPENROUTER_FREE_MODELS", "").split(",") if x.strip()]
-        if not models:
-            try:
-                catalog = _request("GET", "https://openrouter.ai/api/v1/models", api_key=key)
-                for item in catalog.get("data", []):
-                    pricing = item.get("pricing", {})
-                    if str(pricing.get("prompt", "")) == "0" and str(pricing.get("completion", "")) == "0":
-                        models.append(item.get("id", ""))
-            except Exception:
-                pass
+    for provider, account, _env, key in _credentials():
+        if provider == "openrouter":
+            models = _openrouter_free_models(key)
+        else:
+            models = _model_hints(provider, account)
+        # Unknown cloud pricing is never assumed to be free.
         if models:
-            result.append(("openrouter", "https://openrouter.ai/api/v1", models[0], key))
+            result.append((provider, account, PROVIDERS[provider], models[0], key))
     return result
 
 
 def _chat(messages: list[dict], temperature: float, max_tokens: int | None) -> tuple[str, dict, str]:
-    errors: list[str] = []
-    for name, base, model, key in _backends():
+    errors = []
+    for provider, account, base, model, key in _backends():
         body = {"model": model, "messages": messages, "temperature": temperature}
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
@@ -89,11 +132,12 @@ def _chat(messages: list[dict], temperature: float, max_tokens: int | None) -> t
             choice = raw.get("choices", [{}])[0]
             content = choice.get("message", {}).get("content", "")
             if content:
-                return content, raw.get("usage", {}), f"{name}/{model}"
-            errors.append(f"{name}: empty response")
+                return content, raw.get("usage", {}), f"{provider}/{account}/{model}"
+            errors.append(f"{provider}/{account}: empty response")
         except Exception as exc:
-            errors.append(f"{name}: {exc}")
-    raise RuntimeError("No free/local backend succeeded. " + "; ".join(errors) if errors else "No free/local backend configured")
+            errors.append(f"{provider}/{account}: {exc}")
+    detail = "; ".join(errors)
+    raise RuntimeError("No free/local backend succeeded." + (" " + detail if detail else " No backend configured."))
 
 
 def _models() -> list[dict]:
@@ -101,7 +145,7 @@ def _models() -> list[dict]:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "FlossWareGateway/0.2"
+    server_version = "FlossWareGateway/0.3"
 
     def _json(self, status: int, payload: dict) -> None:
         data = json.dumps(payload).encode()
@@ -114,8 +158,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         if path == "/health":
-            backends = [b[0] for b in _backends()]
-            self._json(200, {"status": "ok", "model": MODEL, "policy": "free-only", "backends": backends})
+            self._json(200, {
+                "status": "ok",
+                "model": MODEL,
+                "policy": "free-only",
+                "backends": [f"{p}/{a}" for p, a, *_ in _backends()],
+                "accounts": [f"{p}/{a}" for p, a, *_ in _credentials()],
+            })
         elif path == "/v1/models":
             self._json(200, {"object": "list", "data": _models()})
         else:
