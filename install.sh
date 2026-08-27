@@ -11,6 +11,7 @@ REPO="https://github.com/FlossWare/coding-agent-ai.git"
 RAW_BASE="https://raw.githubusercontent.com/FlossWare/crush-demo/main"
 GATEWAY="$ROOT/crush-gateway.py"
 RUN_GATEWAY="$ROOT/run-crush-gateway.sh"
+ENVFILE="$ROOT/provider-env.sh"
 say(){ printf '\n==> %s\n' "$*"; }
 die(){ printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 [[ -f /etc/fedora-release ]] || die "crush-demo currently supports Fedora only"
@@ -27,28 +28,29 @@ if command -v crush >/dev/null 2>&1; then CRUSH_BIN="$(command -v crush)"; elif 
 say "Installing FlossWare gateway"
 curl -fsSL "$RAW_BASE/gateway.py" -o "$GATEWAY"
 chmod 0755 "$GATEWAY"
-# Import only provider API-key assignments from ~/.bashrc. We deliberately do
-# NOT source ~/.bashrc: Fedora/system-wide rc files may contain interactive
-# shell code and can execute commands or change shell options. The supported
-# FlossWare convention is PROVIDER_API_KEY[_ACCOUNT].
-ENVFILE="$ROOT/provider-env.sh"
+# Extract only the supported credential assignments. Never source ~/.bashrc:
+# Fedora/system rc files can contain arbitrary interactive shell code.
 : > "$ENVFILE"
 if [[ -f "$HOME/.bashrc" ]]; then
-  grep -E '^[[:space:]]*(export[[:space:]]+)?[A-Z0-9]+_API_KEY(_[A-Z0-9_]+)?[[:space:]]*=' "$HOME/.bashrc" | \
+  grep -E '^[[:space:]]*(export[[:space:]]+)?[A-Z0-9]+_API_KEY(_[A-Z0-9_]+)?[[:space:]]*=' "$HOME/.bashrc" |
     sed -E 's/^[[:space:]]*export[[:space:]]+//' >> "$ENVFILE" || true
 fi
 chmod 0600 "$ENVFILE"
-# Start a clean shell solely to read the filtered credential assignments. No
-# profile, system rc, or user rc file is loaded.
-printf -v Q_ENVFILE '%q' "$ENVFILE"
-printf -v Q_PY '%q' "$PY"
-printf -v Q_GATEWAY '%q' "$GATEWAY"
+# This launcher is itself a non-interactive Bash script, so /etc/bashrc and
+# ~/.bashrc are not loaded. It imports only our filtered credential file.
 cat > "$RUN_GATEWAY" <<EOF
 #!/usr/bin/env bash
 set -e
 export FLOSSWARE_GATEWAY_HOST=127.0.0.1
 export FLOSSWARE_GATEWAY_PORT=8765
-exec /bin/bash --noprofile --norc -c 'set +u; [[ -f "$Q_ENVFILE" ]] && source "$Q_ENVFILE" || true; exec "$Q_PY" "$Q_GATEWAY"'
+set +u
+if [[ -f "$ENVFILE" ]]; then
+  set -a
+  source "$ENVFILE"
+  set +a
+fi
+set -u
+exec "$PY" "$GATEWAY"
 EOF
 chmod 0700 "$RUN_GATEWAY"
 cat > "$SERVICE" <<EOF
