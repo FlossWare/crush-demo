@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -32,8 +33,12 @@ def _request(method: str, url: str, body: dict | None = None, api_key: str = "")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:1000]
+        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
 
 
 def _ollama_models() -> list[str]:
@@ -102,6 +107,63 @@ def _backends() -> list[tuple[str, str, str, str, str]]:
     return result
 
 
+def _normalize_tool_calls(tool_calls: object) -> list[dict]:
+    """Return OpenAI-compatible tool calls with JSON-string arguments.
+
+    Providers sometimes return arguments as a dict/object. Crush expects the
+    OpenAI wire format where function.arguments is a JSON-encoded string.
+    """
+    if not isinstance(tool_calls, list):
+        return []
+    normalized: list[dict] = []
+    for index, call in enumerate(tool_calls):
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") or {}
+        if not isinstance(function, dict):
+            function = {}
+        name = function.get("name") or call.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        arguments = function.get("arguments", call.get("arguments", "{}"))
+        if isinstance(arguments, str):
+            try:
+                parsed = json.loads(arguments)
+            except json.JSONDecodeError:
+                # Do not pass malformed arguments downstream to Crush.
+                raise ValueError(f"tool call {name!r} returned invalid JSON arguments")
+            arguments = json.dumps(parsed, separators=(",", ":"))
+        else:
+            try:
+                arguments = json.dumps(arguments if arguments is not None else {}, separators=(",", ":"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"tool call {name!r} returned non-serializable arguments") from exc
+        normalized.append({
+            "id": str(call.get("id") or f"call_flossware_{index}"),
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        })
+    return normalized
+
+
+def _normalize_response(raw: dict) -> dict:
+    """Normalize an upstream completion for Crush."""
+    choices = raw.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("upstream response has no choices")
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if isinstance(message, dict) and message.get("tool_calls") is not None:
+            calls = _normalize_tool_calls(message.get("tool_calls"))
+            message["tool_calls"] = calls
+            if calls:
+                message.pop("content", None)
+                choice["finish_reason"] = "tool_calls"
+    return raw
+
+
 def _chat(messages: list[dict], temperature: float, max_tokens: int | None, extra: dict | None = None) -> tuple[dict, str]:
     errors = []
     extra = extra or {}
@@ -109,14 +171,14 @@ def _chat(messages: list[dict], temperature: float, max_tokens: int | None, extr
         body = {"model": model, "messages": messages, "temperature": temperature}
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
-        # Preserve OpenAI-compatible agent fields such as tools/tool_choice.
         for field in ("tools", "tool_choice", "response_format", "top_p", "stop", "seed"):
             if field in extra:
                 body[field] = extra[field]
         try:
-            raw = _request("POST", f"{base}/chat/completions", body, key)
+            raw = _normalize_response(_request("POST", f"{base}/chat/completions", body, key))
             choice = raw.get("choices", [{}])[0]
-            if choice.get("message", {}).get("content") or choice.get("message", {}).get("tool_calls"):
+            message = choice.get("message", {})
+            if message.get("content") or message.get("tool_calls"):
                 return raw, f"{provider}/{account}/{model}"
             errors.append(f"{provider}/{account}: empty response")
         except Exception as exc:
@@ -129,7 +191,7 @@ def _models() -> list[dict]:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "FlossWareGateway/0.5"
+    server_version = "FlossWareGateway/0.6"
 
     def _json(self, status: int, payload: dict) -> None:
         data = json.dumps(payload).encode()
@@ -143,25 +205,12 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _sse(self, raw: dict, backend: str) -> None:
-        """Turn a completed OpenAI response into valid SSE for Crush.
-
-        The upstream request is non-streaming for maximum provider compatibility,
-        then the completed message is emitted as OpenAI-compatible SSE chunks.
-        Crush primarily needs the streaming protocol, not upstream token streaming.
-        """
         choice = raw.get("choices", [{}])[0]
         message = choice.get("message", {})
         content = message.get("content") or ""
-        tool_calls = message.get("tool_calls")
+        tool_calls = _normalize_tool_calls(message.get("tool_calls")) if message.get("tool_calls") else []
         response_id = raw.get("id", "flossware-" + str(int(time.time() * 1000)))
         created = raw.get("created", int(time.time()))
-
-        chunks = []
-        if tool_calls:
-            chunks.append({"index": 0, "delta": {"role": "assistant", "tool_calls": tool_calls}, "finish_reason": None})
-        elif content:
-            chunks.append({"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": None})
-        chunks.append({"index": 0, "delta": {}, "finish_reason": choice.get("finish_reason", "stop")})
 
         try:
             self.send_response(200)
@@ -169,16 +218,37 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
             self.end_headers()
-            for chunk in chunks:
-                payload = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": MODEL,
-                    "choices": [chunk],
-                }
+            if tool_calls:
+                # Emit one complete, valid tool call. Crush can consume a complete
+                # tool call even though the upstream provider was non-streaming.
+                for index, call in enumerate(tool_calls):
+                    delta = {
+                        "role": "assistant" if index == 0 else None,
+                        "tool_calls": [{
+                            "index": index,
+                            "id": call["id"],
+                            "type": "function",
+                            "function": {
+                                "name": call["function"]["name"],
+                                "arguments": call["function"]["arguments"],
+                            },
+                        }],
+                    }
+                    delta = {k: v for k, v in delta.items() if v is not None}
+                    chunk = {"index": 0, "delta": delta, "finish_reason": None}
+                    payload = {"id": response_id, "object": "chat.completion.chunk", "created": created, "model": MODEL, "choices": [chunk]}
+                    self.wfile.write(("data: " + json.dumps(payload) + "\n\n").encode())
+                    self.wfile.flush()
+                finish = "tool_calls"
+            else:
+                chunk = {"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": None}
+                payload = {"id": response_id, "object": "chat.completion.chunk", "created": created, "model": MODEL, "choices": [chunk]}
                 self.wfile.write(("data: " + json.dumps(payload) + "\n\n").encode())
                 self.wfile.flush()
+                finish = choice.get("finish_reason", "stop")
+            payload = {"id": response_id, "object": "chat.completion.chunk", "created": created, "model": MODEL, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}
+            self.wfile.write(("data: " + json.dumps(payload) + "\n\n").encode())
+            self.wfile.flush()
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -203,18 +273,15 @@ class Handler(BaseHTTPRequestHandler):
             messages = body.get("messages", [])
             if not messages or body.get("model", MODEL) != MODEL:
                 raise ValueError("model must be flossware and messages must be non-empty")
-            raw, backend = _chat(
-                messages,
-                float(body.get("temperature", 0.2)),
-                body.get("max_tokens"),
-                body,
-            )
+            raw, backend = _chat(messages, float(body.get("temperature", 0.2)), body.get("max_tokens"), body)
             if body.get("stream"):
                 self._sse(raw, backend)
                 return
             raw["model"] = MODEL
             raw["flossware_backend"] = backend
             self._json(200, raw)
+        except ValueError as exc:
+            self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
         except Exception as exc:
             self._json(503, {"error": {"message": str(exc), "type": "flossware_unavailable"}})
 
