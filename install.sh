@@ -56,19 +56,19 @@ say "Installing FlossWare gateway"
 curl -fsSL "$RAW_BASE/gateway.py" -o "$GATEWAY"
 chmod 0755 "$GATEWAY"
 
-# ~/.bashrc is the credential source of truth. Start Bash with nounset
-# disabled before Fedora's /etc/bashrc is sourced. Do not pass positional
-# parameters to bash -c; embedding shell-quoted paths avoids Bash treating a
-# literal `--` as an invocation option on some versions.
+# Do not inherit shell options into the gateway. Bash is started with --noprofile
+# and --norc, so Fedora's /etc/bashrc cannot run before we explicitly disable
+# nounset and source the user's .bashrc. No positional arguments are passed to
+# bash -c, avoiding the previous `--` invocation bug entirely.
 printf -v Q_PY '%q' "$PY"
 printf -v Q_GATEWAY '%q' "$GATEWAY"
+printf -v Q_BASHRC '%q' "$HOME/.bashrc"
 cat > "$RUN_GATEWAY" <<EOF
 #!/usr/bin/env bash
 set -e
 export FLOSSWARE_GATEWAY_HOST=127.0.0.1
 export FLOSSWARE_GATEWAY_PORT=8765
-unset SHELLOPTS BASH_ENV
-exec env -u SHELLOPTS -u BASH_ENV bash --noprofile --norc +u -c 'if [[ -f "\$HOME/.bashrc" ]]; then source "\$HOME/.bashrc" || true; fi; exec $Q_PY $Q_GATEWAY'
+exec /bin/bash --noprofile --norc -c 'set +u; if [[ -f $Q_BASHRC ]]; then source $Q_BASHRC || true; fi; exec $Q_PY $Q_GATEWAY'
 EOF
 chmod 0700 "$RUN_GATEWAY"
 
@@ -91,29 +91,21 @@ EOF
 wait_for_gateway() {
   local i
   for i in {1..20}; do
-    if curl -fsS --max-time 1 http://127.0.0.1:8765/health >/dev/null 2>&1; then
-      return 0
-    fi
+    if curl -fsS --max-time 1 http://127.0.0.1:8765/health >/dev/null 2>&1; then return 0; fi
     sleep 0.25
   done
   return 1
 }
 
 start_gateway() {
-  if curl -fsS --max-time 1 http://127.0.0.1:8765/health >/dev/null 2>&1; then
-    return 0
-  fi
+  if curl -fsS --max-time 1 http://127.0.0.1:8765/health >/dev/null 2>&1; then return 0; fi
 
   if [[ -n "${XDG_RUNTIME_DIR:-}" && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && systemctl --user daemon-reload 2>/dev/null; then
-    if systemctl --user enable --now flossware-crush-gateway.service 2>/dev/null && wait_for_gateway; then
-      return 0
-    fi
+    if systemctl --user enable --now flossware-crush-gateway.service 2>/dev/null && wait_for_gateway; then return 0; fi
   fi
 
   if [[ -s "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    if wait_for_gateway; then
-      return 0
-    fi
+    if wait_for_gateway; then return 0; fi
     kill "$(cat "$PIDFILE")" 2>/dev/null || true
   fi
 
@@ -122,9 +114,7 @@ start_gateway() {
   nohup "$RUN_GATEWAY" >>"$LOGFILE" 2>&1 </dev/null &
   echo $! >"$PIDFILE"
 
-  if wait_for_gateway; then
-    return 0
-  fi
+  if wait_for_gateway; then return 0; fi
 
   printf '\nERROR: FlossWare gateway failed to become ready.\n' >&2
   printf 'Log: %s\n' "$LOGFILE" >&2
@@ -171,11 +161,7 @@ chmod +x "$HOME/.local/bin/flossware-crush"
 cat > "$HOME/.local/bin/flossware-models" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-curl -fsS --max-time 5 http://127.0.0.1:8765/health >/dev/null || {
-  echo 'FlossWare gateway is not running' >&2
-  echo 'Check ~/.flossware/ai/crush-gateway.log' >&2
-  exit 1
-}
+curl -fsS --max-time 5 http://127.0.0.1:8765/health >/dev/null || { echo 'FlossWare gateway is not running' >&2; echo 'Check ~/.flossware/ai/crush-gateway.log' >&2; exit 1; }
 printf '\nModels:\n'
 curl -fsS --max-time 5 http://127.0.0.1:8765/v1/models
 EOF
@@ -191,13 +177,7 @@ command -v "$CRUSH_BIN" >/dev/null 2>&1 && ok 'Crush' || bad 'Crush'
 [[ -x "$VENV/bin/pa" ]] && ok 'coding-agent-ai / pa' || bad 'coding-agent-ai / pa'
 [[ -f "$CONFIG_DIR/crushrc" ]] && ok 'Crush configuration' || bad 'Crush configuration'
 [[ -d "$ROOT" ]] && ok '~/.flossware/ai reused' || bad '~/.flossware/ai'
-if curl -fsS --max-time 5 http://127.0.0.1:8765/health >/dev/null 2>&1; then
-  ok 'FlossWare gateway'
-else
-  bad 'FlossWare gateway'
-  printf '    log: %s\n' "$LOGFILE"
-  if [[ -s "$LOGFILE" ]]; then tail -n 20 "$LOGFILE" | sed 's/^/    /'; fi
-fi
+if curl -fsS --max-time 5 http://127.0.0.1:8765/health >/dev/null 2>&1; then ok 'FlossWare gateway'; else bad 'FlossWare gateway'; printf '    log: %s\n' "$LOGFILE"; [[ -s "$LOGFILE" ]] && tail -n 20 "$LOGFILE" | sed 's/^/    /'; fi
 if curl -fsS --max-time 5 http://127.0.0.1:8765/v1/models 2>/dev/null | grep -q 'flossware'; then ok 'flossware model exposed'; else bad 'flossware model exposed'; fi
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then ok 'GitHub CLI authenticated'; else printf '  - GitHub CLI authentication not detected\n'; fi
 ok 'Free/local-only gateway policy'
