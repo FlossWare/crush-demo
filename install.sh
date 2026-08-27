@@ -56,21 +56,16 @@ say "Installing FlossWare gateway"
 curl -fsSL "$RAW_BASE/gateway.py" -o "$GATEWAY"
 chmod 0755 "$GATEWAY"
 
-# ~/.bashrc is the credential source of truth. Source it only in the gateway
-# process; never copy secret values to a credentials file.
+# ~/.bashrc is the credential source of truth. It may use nounset-sensitive
+# variables, so disable nounset only while sourcing it. Secret values are
+# never copied to disk.
 cat > "$RUN_GATEWAY" <<EOF
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
 if [[ -f "\$HOME/.bashrc" ]]; then
-  # Some .bashrc files contain interactive-only commands. A failure here must
-  # not prevent the gateway from starting with the variables already exported.
-  set +e
-  source "\$HOME/.bashrc"
-  BASHRC_STATUS=\$?
-  set -e
-  if [[ \$BASHRC_STATUS -ne 0 ]]; then
-    echo "[flossware-gateway] warning: ~/.bashrc returned \$BASHRC_STATUS; continuing" >&2
-  fi
+  set +u
+  source "\$HOME/.bashrc" || true
+  set -u
 fi
 export FLOSSWARE_GATEWAY_HOST=127.0.0.1
 export FLOSSWARE_GATEWAY_PORT=8765
@@ -106,7 +101,6 @@ wait_for_gateway() {
 }
 
 start_gateway() {
-  # Reuse a healthy existing gateway when reinstalling.
   if curl -fsS --max-time 1 http://127.0.0.1:8765/health >/dev/null 2>&1; then
     return 0
   fi
@@ -178,7 +172,7 @@ chmod +x "$HOME/.local/bin/flossware-crush"
 cat > "$HOME/.local/bin/flossware-models" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-curl -fsS --max-time 5 http://127.0.0.1:8765/health || {
+curl -fsS --max-time 5 http://127.0.0.1:8765/health >/dev/null || {
   echo 'FlossWare gateway is not running' >&2
   echo 'Check ~/.flossware/ai/crush-gateway.log' >&2
   exit 1
@@ -205,7 +199,7 @@ else
   printf '    log: %s\n' "$LOGFILE"
   if [[ -s "$LOGFILE" ]]; then tail -n 20 "$LOGFILE" | sed 's/^/    /'; fi
 fi
-if curl -fsS --max-time 5 http://127.0.0.1:8765/v1/models | grep -q 'flossware'; then ok 'flossware model exposed'; else bad 'flossware model exposed'; fi
+if curl -fsS --max-time 5 http://127.0.0.1:8765/v1/models 2>/dev/null | grep -q 'flossware'; then ok 'flossware model exposed'; else bad 'flossware model exposed'; fi
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then ok 'GitHub CLI authenticated'; else printf '  - GitHub CLI authentication not detected\n'; fi
 ok 'Free/local-only gateway policy'
 ok 'Anthropic/RH/OpenAI backends excluded'
