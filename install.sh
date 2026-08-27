@@ -56,13 +56,22 @@ say "Installing FlossWare gateway"
 curl -fsSL "$RAW_BASE/gateway.py" -o "$GATEWAY"
 chmod 0755 "$GATEWAY"
 
-# ~/.bashrc is the credential source of truth. The launcher sources it at
-# startup, so PROVIDER_API_KEY[_ACCOUNT] variables are discovered without
-# copying their secret values into another credentials file.
+# ~/.bashrc is the credential source of truth. Source it only in the gateway
+# process; never copy secret values to a credentials file.
 cat > "$RUN_GATEWAY" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-[[ -f "\$HOME/.bashrc" ]] && source "\$HOME/.bashrc" || true
+if [[ -f "\$HOME/.bashrc" ]]; then
+  # Some .bashrc files contain interactive-only commands. A failure here must
+  # not prevent the gateway from starting with the variables already exported.
+  set +e
+  source "\$HOME/.bashrc"
+  BASHRC_STATUS=\$?
+  set -e
+  if [[ \$BASHRC_STATUS -ne 0 ]]; then
+    echo "[flossware-gateway] warning: ~/.bashrc returned \$BASHRC_STATUS; continuing" >&2
+  fi
+fi
 export FLOSSWARE_GATEWAY_HOST=127.0.0.1
 export FLOSSWARE_GATEWAY_PORT=8765
 exec "$PY" "$GATEWAY"
@@ -85,23 +94,49 @@ RestartSec=2
 WantedBy=default.target
 EOF
 
-# systemd --user requires a live user D-Bus session. This may be absent when
-# invoked over SSH, from a bare TTY, or through curl|bash. Do not emit a
-# confusing bus error: fall back to a user-owned background process now.
+wait_for_gateway() {
+  local i
+  for i in {1..20}; do
+    if curl -fsS --max-time 1 http://127.0.0.1:8765/health >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
 start_gateway() {
+  # Reuse a healthy existing gateway when reinstalling.
+  if curl -fsS --max-time 1 http://127.0.0.1:8765/health >/dev/null 2>&1; then
+    return 0
+  fi
+
   if [[ -n "${XDG_RUNTIME_DIR:-}" && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && systemctl --user daemon-reload 2>/dev/null; then
-    systemctl --user enable --now flossware-crush-gateway.service
-    return
+    if systemctl --user enable --now flossware-crush-gateway.service 2>/dev/null && wait_for_gateway; then
+      return 0
+    fi
   fi
 
   if [[ -s "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    return
+    if wait_for_gateway; then
+      return 0
+    fi
+    kill "$(cat "$PIDFILE")" 2>/dev/null || true
   fi
+
   rm -f "$PIDFILE"
-  nohup "$RUN_GATEWAY" >>"$LOGFILE" 2>&1 &
+  : > "$LOGFILE"
+  nohup "$RUN_GATEWAY" >>"$LOGFILE" 2>&1 </dev/null &
   echo $! >"$PIDFILE"
-  sleep 1
-  kill -0 "$(cat "$PIDFILE")" 2>/dev/null || die "FlossWare gateway failed to start; see $LOGFILE"
+
+  if wait_for_gateway; then
+    return 0
+  fi
+
+  printf '\nERROR: FlossWare gateway failed to become ready.\n' >&2
+  printf 'Log: %s\n' "$LOGFILE" >&2
+  tail -n 40 "$LOGFILE" >&2 || true
+  return 1
 }
 
 start_gateway
@@ -145,6 +180,7 @@ cat > "$HOME/.local/bin/flossware-models" <<'EOF'
 set -euo pipefail
 curl -fsS --max-time 5 http://127.0.0.1:8765/health || {
   echo 'FlossWare gateway is not running' >&2
+  echo 'Check ~/.flossware/ai/crush-gateway.log' >&2
   exit 1
 }
 printf '\nModels:\n'
@@ -162,7 +198,13 @@ command -v "$CRUSH_BIN" >/dev/null 2>&1 && ok 'Crush' || bad 'Crush'
 [[ -x "$VENV/bin/pa" ]] && ok 'coding-agent-ai / pa' || bad 'coding-agent-ai / pa'
 [[ -f "$CONFIG_DIR/crushrc" ]] && ok 'Crush configuration' || bad 'Crush configuration'
 [[ -d "$ROOT" ]] && ok '~/.flossware/ai reused' || bad '~/.flossware/ai'
-if curl -fsS --max-time 5 http://127.0.0.1:8765/health >/dev/null 2>&1; then ok 'FlossWare gateway'; else bad 'FlossWare gateway'; fi
+if curl -fsS --max-time 5 http://127.0.0.1:8765/health >/dev/null 2>&1; then
+  ok 'FlossWare gateway'
+else
+  bad 'FlossWare gateway'
+  printf '    log: %s\n' "$LOGFILE"
+  if [[ -s "$LOGFILE" ]]; then tail -n 20 "$LOGFILE" | sed 's/^/    /'; fi
+fi
 if curl -fsS --max-time 5 http://127.0.0.1:8765/v1/models | grep -q 'flossware'; then ok 'flossware model exposed'; else bad 'flossware model exposed'; fi
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then ok 'GitHub CLI authenticated'; else printf '  - GitHub CLI authentication not detected\n'; fi
 ok 'Free/local-only gateway policy'
