@@ -10,22 +10,26 @@ if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 2 http://127.0.0.1:11
   provider add ollama --name "Ollama (local, $0)" --type ollama --base-url "http://127.0.0.1:11434/v1" --discover-models true
 fi
 
-# Free-provider accounts. These are deliberately opt-in through environment
-# variables. Do not add paid credentials here.
-if [[ -n "${GEMINI_API_KEY:-}" ]]; then
-  provider add gemini --name "Gemini (personal/free account)" --type gemini --api-key "$GEMINI_API_KEY"
+# Free-provider accounts are opt-in. For cloud providers, register only
+# explicitly named models supplied by the operator. This avoids accidentally
+# exposing a paid model through a provider that also has free models.
+if [[ -n "${GROQ_API_KEY:-}" && -n "${FLOSSWARE_GROQ_MODEL:-}" ]]; then
+  provider add groq --name "Groq (personal/free model)" --type openai-compat --base-url "https://api.groq.com/openai/v1" --api-key "$GROQ_API_KEY"
+  model add "groq/${FLOSSWARE_GROQ_MODEL}" --name "Groq free model"
 fi
 
-if [[ -n "${GROQ_API_KEY:-}" ]]; then
-  provider add groq --name "Groq (personal/free account)" --type openai-compat --base-url "https://api.groq.com/openai/v1" --api-key "$GROQ_API_KEY"
+if [[ -n "${CEREBRAS_API_KEY:-}" && -n "${FLOSSWARE_CEREBRAS_MODEL:-}" ]]; then
+  provider add cerebras --name "Cerebras (personal/free model)" --type openai-compat --base-url "https://api.cerebras.ai/v1" --api-key "$CEREBRAS_API_KEY"
+  model add "cerebras/${FLOSSWARE_CEREBRAS_MODEL}" --name "Cerebras free model"
 fi
 
-if [[ -n "${CEREBRAS_API_KEY:-}" ]]; then
-  provider add cerebras --name "Cerebras (personal/free account)" --type openai-compat --base-url "https://api.cerebras.ai/v1" --api-key "$CEREBRAS_API_KEY"
-fi
-
-if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
+if [[ -n "${OPENROUTER_API_KEY:-}" && -n "${FLOSSWARE_OPENROUTER_FREE_MODELS:-}" ]]; then
   provider add openrouter --name "OpenRouter (personal/free models only)" --type openai-compat --base-url "https://openrouter.ai/api/v1" --api-key "$OPENROUTER_API_KEY"
+  IFS=',' read -ra OR_MODELS <<< "$FLOSSWARE_OPENROUTER_FREE_MODELS"
+  for m in "${OR_MODELS[@]}"; do
+    m="${m//[[:space:]]/}"
+    [[ -z "$m" ]] || model add "openrouter/$m" --name "OpenRouter free model"
+  done
 fi
 
 # Never inherit paid/employer providers from another Crush configuration.
@@ -33,10 +37,11 @@ provider remove anthropic 2>/dev/null || true
 provider remove redhat 2>/dev/null || true
 provider remove openai 2>/dev/null || true
 
-# GitHub MCP is enabled only when the operator explicitly supplies a token.
+# GitHub MCP: prefer an explicit token, otherwise use the existing gh login.
 if [[ -n "${GH_PAT:-}" ]]; then
   mcp add github --type http --url "https://api.githubcopilot.com/mcp/" --header Authorization "Bearer $GH_PAT"
+elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+  mcp add github --type http --url "https://api.githubcopilot.com/mcp/" --header Authorization "Bearer $(gh auth token)"
 fi
 
-# Conservative permissions for the demo. Crush will still prompt for risky actions.
 permissions allow view ls grep edit
