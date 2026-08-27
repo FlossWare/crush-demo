@@ -56,15 +56,16 @@ say "Installing FlossWare gateway"
 curl -fsSL "$RAW_BASE/gateway.py" -o "$GATEWAY"
 chmod 0755 "$GATEWAY"
 
-# ~/.bashrc is the credential source of truth. Source it in a clean child
-# shell with nounset disabled, then exec Python so all exported variables are
-# preserved without allowing interactive shell setup to kill the gateway.
+# ~/.bashrc is the credential source of truth. Run a clean, non-interactive
+# Bash with nounset disabled from process startup. This matters on Fedora:
+# /etc/bashrc can inspect BASHRCSOURCED before our command body executes.
+# BASH_ENV and SHELLOPTS are removed so caller shell state cannot leak in.
 cat > "$RUN_GATEWAY" <<EOF
 #!/usr/bin/env bash
 set -e
 export FLOSSWARE_GATEWAY_HOST=127.0.0.1
 export FLOSSWARE_GATEWAY_PORT=8765
-exec bash -c 'set +u; if [[ -f "\$HOME/.bashrc" ]]; then source "\$HOME/.bashrc" || true; fi; exec "\$1" "\$2"' -- "$PY" "$GATEWAY"
+exec env -u BASH_ENV -u SHELLOPTS bash +u --noprofile --norc -c 'if [[ -f "\$HOME/.bashrc" ]]; then source "\$HOME/.bashrc" || true; fi; exec "\$1" "\$2"' -- "$PY" "$GATEWAY"
 EOF
 chmod 0700 "$RUN_GATEWAY"
 
