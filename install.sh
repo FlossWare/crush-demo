@@ -56,16 +56,19 @@ say "Installing FlossWare gateway"
 curl -fsSL "$RAW_BASE/gateway.py" -o "$GATEWAY"
 chmod 0755 "$GATEWAY"
 
-# ~/.bashrc is the credential source of truth. Run a clean, non-interactive
-# Bash with nounset disabled from process startup. This matters on Fedora:
-# /etc/bashrc can inspect BASHRCSOURCED before our command body executes.
-# BASH_ENV and SHELLOPTS are removed so caller shell state cannot leak in.
+# ~/.bashrc is the credential source of truth. Start Bash with nounset
+# disabled before Fedora's /etc/bashrc is sourced. Do not pass positional
+# parameters to bash -c; embedding shell-quoted paths avoids Bash treating a
+# literal `--` as an invocation option on some versions.
+printf -v Q_PY '%q' "$PY"
+printf -v Q_GATEWAY '%q' "$GATEWAY"
 cat > "$RUN_GATEWAY" <<EOF
 #!/usr/bin/env bash
 set -e
 export FLOSSWARE_GATEWAY_HOST=127.0.0.1
 export FLOSSWARE_GATEWAY_PORT=8765
-exec env -u BASH_ENV -u SHELLOPTS bash +u --noprofile --norc -c 'if [[ -f "\$HOME/.bashrc" ]]; then source "\$HOME/.bashrc" || true; fi; exec "\$1" "\$2"' -- "$PY" "$GATEWAY"
+unset SHELLOPTS BASH_ENV
+exec env -u SHELLOPTS -u BASH_ENV bash --noprofile --norc +u -c 'if [[ -f "\$HOME/.bashrc" ]]; then source "\$HOME/.bashrc" || true; fi; exec $Q_PY $Q_GATEWAY'
 EOF
 chmod 0700 "$RUN_GATEWAY"
 
