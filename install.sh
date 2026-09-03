@@ -8,7 +8,12 @@ say(){ printf '\n==> %s\n' "$*"; }
 die(){ printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
 say "Installing/updating agent-setup"
-curl -fsSL --retry 3 "$SETUP_INSTALLER" | bash -s -- --agent crush
+tmp_installer="$(mktemp)"
+trap 'rm -f "$tmp_installer"' EXIT
+curl -fsSL --retry 3 "$SETUP_INSTALLER" -o "$tmp_installer"
+[[ -s "$tmp_installer" ]] || die "agent-setup installer download was empty"
+chmod 0700 "$tmp_installer"
+bash "$tmp_installer" --agent crush
 
 FLOSSWARE_AI="${FLOSSWARE_AI_BIN:-$HOME/.local/bin/flossware-ai}"
 [[ -x "$FLOSSWARE_AI" ]] || die "flossware-ai was not installed at $FLOSSWARE_AI"
