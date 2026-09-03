@@ -3,11 +3,11 @@
 A thin Fedora integration and dogfood environment for the FlossWare coding-agent stack.
 
 ```text
-coding-agent-setup
+agent-setup
   -> Crush setup
   -> FlossWare gateway
   -> free/local provider account
-  -> coding-agent-ai + workers/arbiter
+  -> agent-ai + workers/arbiter
   -> Crush
   -> GitHub/files/tests
 ```
@@ -18,13 +18,13 @@ coding-agent-setup
 curl -fsSL https://raw.githubusercontent.com/FlossWare/crush-demo/main/install.sh | bash
 ```
 
-The installer is intentionally thin. It installs/updates `coding-agent-setup`, then delegates Crush provisioning to:
+The installer is intentionally thin. It installs/updates `agent-setup`, then delegates Crush provisioning to:
 
 ```bash
 flossware-ai setup crush --free-only
 ```
 
-`coding-agent-setup` owns the machine setup: the managed `~/.flossware/ai` environment, Crush installation, local gateway, systemd user service, Crush configuration, model exposure, GitHub MCP integration, and free/local-only policy.
+`agent-setup` owns the machine setup: the managed `~/.FlossWare/ai` environment, Crush installation, local gateway, systemd user service, Crush configuration, model exposure, GitHub MCP integration, and free/local-only policy.
 
 After installation:
 
@@ -134,6 +134,6 @@ This repository is deliberately a personal Fedora development and dogfood enviro
 - no OpenAI backend
 - free/local model policy
 - existing personal environment variables reused
-- `~/.flossware/ai` remains the main FlossWare runtime
+- `~/.FlossWare/ai` remains the main FlossWare runtime
 
-The goal is to **use FlossWare to build FlossWare**. Provisioning is owned by `coding-agent-setup`; this repository exists to prove the integrated Crush workflow works.
+The goal is to **use FlossWare to build FlossWare**. Provisioning is owned by `agent-setup`; this repository exists to prove the integrated Crush workflow works.
