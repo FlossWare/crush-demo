@@ -1,14 +1,14 @@
 # FlossWare Crush Demo
 
-A thin Fedora integration layer that turns the existing FlossWare stack into a usable coding agent.
+A thin Fedora integration and dogfood environment for the FlossWare coding-agent stack.
 
 ```text
-Crush
-  -> model: flossware
-  -> localhost:8765/v1
+agent-setup
+  -> Crush setup
   -> FlossWare gateway
   -> free/local provider account
-  -> coding-agent-ai + workers/arbiter
+  -> agent-ai + workers/arbiter
+  -> Crush
   -> GitHub/files/tests
 ```
 
@@ -18,12 +18,19 @@ Crush
 curl -fsSL https://raw.githubusercontent.com/FlossWare/crush-demo/main/install.sh | bash
 ```
 
-The Fedora-only installer reuses `~/.flossware/ai`, updates `coding-agent-ai`, installs Crush if needed, installs the local gateway, creates the systemd user service, and writes the global Crush `crushrc`.
+The installer is intentionally thin. It installs/updates `agent-setup`, then delegates Crush provisioning to:
+
+```bash
+flossware-ai setup crush --free-only
+```
+
+`agent-setup` owns the machine setup: the managed `~/.FlossWare/ai` environment, Crush installation, local gateway, systemd user service, Crush configuration, model exposure, GitHub MCP integration, and free/local-only policy.
 
 After installation:
 
 ```bash
-flossware-crush-doctor
+flossware-ai doctor
+flossware-ai dogfood --strict
 flossware-models
 flossware-crush
 ```
@@ -97,7 +104,7 @@ The backend can be Ollama or an eligible configured provider/account. Provider/a
 
 ## Worker / arbiter
 
-The existing local worker/arbiter implementation remains the reusable intelligence layer:
+The existing local worker/arbiter implementation remains the reusable intelligence layer. It can also be exercised directly:
 
 ```bash
 pa "Review this repository for correctness" --repo . --max-iter 3
@@ -107,7 +114,7 @@ The intended development loop is:
 
 ```text
 Crush
-  -> FlossWare
+  -> FlossWare gateway
   -> worker(s)
   -> implementation/tests
   -> arbiter
@@ -119,7 +126,7 @@ Remote workers are intentionally deferred. Thompson Sampling, genetic algorithms
 
 ## Personal-only boundary
 
-This repository is deliberately a personal Fedora development environment:
+This repository is deliberately a personal Fedora development and dogfood environment:
 
 - no Red Hat configuration
 - no Red Hat credentials
@@ -127,6 +134,6 @@ This repository is deliberately a personal Fedora development environment:
 - no OpenAI backend
 - free/local model policy
 - existing personal environment variables reused
-- `~/.flossware/ai` remains the main FlossWare runtime
+- `~/.FlossWare/ai` remains the main FlossWare runtime
 
-The goal is to **use FlossWare to build FlossWare**. Once this environment is proven, `coding-agent-setup` can package it rather than being required to develop it.
+The goal is to **use FlossWare to build FlossWare**. Provisioning is owned by `agent-setup`; this repository exists to prove the integrated Crush workflow works.
